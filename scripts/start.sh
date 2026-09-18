@@ -42,9 +42,14 @@ fi
 if [ -z "${PORT}" ]; then PORT="${SERVICE_PORT:-8080}"; fi
 if [ -n "${SERVICE_PORT:-}" ] && [ "${SERVICE_PORT}" != "${PORT}" ]; then
   warn "忽略继承来的 SERVICE_PORT=${SERVICE_PORT}（本服务的地址契约固定 :${PORT}）。"
-  warn "若平台报 “restart finished but health check failed: http://127.0.0.1:${SERVICE_PORT}/health”，"
-  warn "那是平台『服务登记』里的端口填错了：改成 port=${PORT} / health_url=http://127.0.0.1:${PORT}/health"
-  warn "（电视/小度/Edge/Brain 的 URL 都钉在 ${PORT}，本服务不能跟着平台分配的口走）。"
+  warn "平台登记里的端口如果是 ${SERVICE_PORT}：本脚本会把它开成『附加健康检查口』"
+  warn "（只绑 127.0.0.1，不对外），平台健康检查照样能过；地址契约口仍然是 ${PORT}。"
+  # 平台登记的口 ≠ 契约口 → 附加监听它（健康检查用）。
+  # 显式设过 ASSET_HUB_EXTRA_PORTS（含 off）时以显式配置为准。
+  if [ -z "${ASSET_HUB_EXTRA_PORTS:-}" ]; then
+    ASSET_HUB_EXTRA_PORTS="${SERVICE_PORT}"
+    echo_log "附加监听 127.0.0.1:${SERVICE_PORT}（平台登记的口，供健康检查；不对外、不进 mDNS）"
+  fi
 fi
 
 [ -x "${BIN}" ] || die "缺少可执行文件 ${BIN}（发版包内容不完整？）"
@@ -65,6 +70,13 @@ set +a
 
 ASSET_HUB_DIR="${ASSET_HUB_DIR:-${BACKEND_DIR}/data/img}"
 export ASSET_HUB_DIR ASSET_HUB_PORT="${PORT}" ASSET_HUB_HOST="${ASSET_HUB_HOST:-0.0.0.0}"
+export ASSET_HUB_EXTRA_PORTS="${ASSET_HUB_EXTRA_PORTS:-}"
+
+# 端点落盘（发现的第一层）：本服务 runtime 里一份，共享发现目录里再一份 ——
+# Brain/Edge 读它就知道端口，不必各自硬编码 8080（mDNS 只是跨设备那层的兜底）。
+export ASSET_HUB_SERVICE_ID="${ASSET_HUB_SERVICE_ID:-home-asset-hub}"
+export ASSET_HUB_ENDPOINT_FILE="${ASSET_HUB_ENDPOINT_FILE:-${BACKEND_DIR}/endpoint.json}"
+export ASSET_HUB_DISCOVERY_DIR="${ASSET_HUB_DISCOVERY_DIR:-$(cd "${RUNTIME_DIR}/.." && pwd)/.discovery}"
 mkdir -p "${ASSET_HUB_DIR}"
 
 if [ -f "${PID_FILE}" ]; then

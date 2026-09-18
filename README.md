@@ -91,35 +91,49 @@ bash scripts/backup.sh
 - 契约：`port=8080`（电视/小度的 URL 就是它）、`healthUrl=http://127.0.0.1:8080/health`、
   `startCmd/stopCmd/restartCmd = bash scripts/{start,stop,restart}.sh`
 
-#### ⚠️ 平台「服务登记」里的端口必须是 8080（踩过一次）
+#### 端口：由本服务决定，消费方靠「发现」跟着走
 
-2026-09-18 首次走平台发版时，服务登记页**自动给了一个空闲口 4236**，于是流水线跑成：
+**8080 不是我们的内部约定，而是外部消费方的起点默认值** —— 所以正解不是让四方继续硬编码它，
+而是**端口由本服务决定**（`ASSET_HUB_PORT`），消费方**按名字发现**：
+
+| 层 | 机制 | 谁用 | 特点 |
+|---|---|---|---|
+| 1 | **端点文件**：本服务启动时写 `<runtime>/backend/endpoint.json` 与 `<runtime>/../.discovery/home-asset-hub.json`（含 port / public_base / health / endpoints） | Brain、mac_edge（同机） | 确定性、零延迟，读到还要过 `/health` 自校验 |
+| 2 | **mDNS** `_ha-img-server._tcp`（TXT 带 `port=` / `base=` / `health=` / `version=`） | iOS、电视等跨设备；Brain/Edge 兜底 | 跨设备唯一可行；实测本机 `dns-sd` 不稳，故不做主路径 |
+| 3 | 默认 `8080` | 兜底 | = 改动前的行为，永远退得回去 |
+
+- 消费方解析顺序统一为：**显式 env > 端点文件 > mDNS > 已验证缓存 > 8080**，每层都过 `/health` 自校验
+  （发现到的端口不通就丢掉，不会把人带到没应答的口上）；发现失败有**负缓存**（15s），
+  请求路径不会被 Bonjour 挡住（首次阻塞一次、之后后台刷新）。
+- 换端口只改**这一处**：`ASSET_HUB_PORT=18099` → 端点文件/mDNS 自动跟着变，Brain/Edge 下次解析即跟上。
+- 已知边界：iOS 端目前仍写死 `http://img-server.local:8080` 作为兜底常量（发现路径可用时会用 SRV 端口）；
+  要让 iPhone 也完全跟随，需要一次 App 端调整。
+
+**平台登记**：建议按契约填 `port=8080`（健康检查指向真身）；填了别的口也不会红 ——
+`start.sh` 会把平台注入的 `SERVICE_PORT` 开成「附加健康检查口」（只绑 loopback），
+见下面这节。
 
 ```
-[deploy] pipeline-edf703c6 restart via contract (SERVICE_PORT=4236): bash scripts/restart.sh
-restart finished but health check failed: http://127.0.0.1:4236/health
+ASSET_HUB_PORT=8080              # 契约口（本服务决定；消费者发现它）
+ASSET_HUB_EXTRA_PORTS=4236,9000  # 附加监听口（平台填错口的兜底）；off/-/none=不附加
+ASSET_HUB_EXTRA_HOST=127.0.0.1   # 附加口只绑 loopback（不对外、不进 mDNS）
+ASSET_HUB_SERVICE_ID=home-asset-hub
+ASSET_HUB_ENDPOINT_FILE=<runtime>/backend/endpoint.json     # start.sh 默认给
+ASSET_HUB_DISCOVERY_DIR=<runtime>/../.discovery             # start.sh 默认给
 ```
 
-服务其实起得好好的（`scripts/start.sh` 刻意忽略继承来的 `PORT/SERVICE_PORT`，永远绑 8080），
-**失败的是平台在 4236 上做健康检查**。修正方式（改登记，不是改代码）：
+#### 踩过的坑
 
-```bash
-curl -X PUT http://127.0.0.1:4220/api/services/home-asset-hub \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"家庭资产管理","runtimeDir":"/Users/gaolei/runtime/home-asset-hub",
-       "healthUrl":"http://127.0.0.1:8080/health","port":8080,
-       "startCmd":"bash scripts/start.sh","stopCmd":"bash scripts/stop.sh",
-       "restartCmd":"bash scripts/restart.sh","defaultBranch":"main",
-       "restartNotifyUrl":"","restartPollUrl":"","gracefulRestartMaxWaitMs":0}'
-```
+1. **健康检查查错口**（2026-09-18）：平台服务登记页自动填了空闲口 4236，服务按契约绑 8080 →
+   流水线报 `restart finished but health check failed: http://127.0.0.1:4236/health`。
+   修法是改登记（`PUT /api/services/home-asset-hub` → `port=8080`），现在另有附加监听兜底。
+2. **`dns-sd` 的坑（发现路径本来是坏的）**：`dns-sd -L` 命中后**不退出**，`subprocess.run` 会一直等到
+   超时并把已读到的输出丢掉 → 明明有服务却永远发现不到；`dns-sd -B` 在本机也列不出自家注册，
+   而且 `-B` 的实例名在**最后一列**（早先按第 4 列取到的是域名）。现在改成 Popen 边读边判 + 已知名字直查。
+3. **导入期不做发现**：`DEFAULT_LAN_PUBLIC_BASE = default_lan_public_base()` 曾在 import 时触发发现，
+   把负缓存打脏、连带影响别处；现在导入期只算默认端口的形态。
+4. 行尾 `Flags: 1` 这类**带冒号的尾巴**会把「按最后一个冒号取端口」读成 `1`；改为取第一个 token 再切 host:port。
 
-（平台 UI「服务契约 → 配置」里改这两项等价。）之后重跑流水线即绿：`ok version=<hash>`。
-
-**为什么不能迁就平台给的口**：这个端口不是内部约定，是**外部消费方钉死的地址** ——
-小米电视/小度按 `http://<mac-lan-ip>:8080/<key>` 拉字节、Edge 按 `PHOTO_UPLOAD_PORT=8080`
-上传、Brain 的 `assets.storage.key` 与 mDNS 广告（`_ha-img-server._tcp port=8080`）也都在 8080。
-把服务挪到别的口 = 电视/音箱/Edge 全断。所以本服务是「端口由外部契约决定」的少数派，
-平台健康检查跟着登记走 8080 即可。
 
 ```
 <runtime>/home-asset-hub/
@@ -138,7 +152,12 @@ curl -X PUT http://127.0.0.1:4220/api/services/home-asset-hub \
 | 新名 | 兼容旧名 | 默认 |
 |---|---|---|
 | `ASSET_HUB_HOST` | `PHOTO_UPLOAD_HOST` | `0.0.0.0` |
-| `ASSET_HUB_PORT` | `PHOTO_UPLOAD_PORT` | `8080` |
+| `ASSET_HUB_PORT` | `PHOTO_UPLOAD_PORT` | `8080`（外部契约口） |
+| `ASSET_HUB_EXTRA_PORTS` | — | 空（附加健康检查口，逗号分隔；只绑 loopback；`off` 关） |
+| `ASSET_HUB_EXTRA_HOST` | — | `127.0.0.1` |
+| `ASSET_HUB_SERVICE_ID` | — | `home-asset-hub`（端点文件名/字段） |
+| `ASSET_HUB_ENDPOINT_FILE` | — | `<runtime>/backend/endpoint.json`（start.sh 给） |
+| `ASSET_HUB_DISCOVERY_DIR` | — | `<runtime>/../.discovery`（start.sh 给；写 `<id>.json`） |
 | `ASSET_HUB_DIR` | `PHOTO_UPLOAD_DIR` | `<runtime>/backend/data/img` |
 | `ASSET_HUB_PUBLIC_BASE` | `PHOTO_PUBLIC_BASE` | 按 LAN IP 自动探测 |
 | `ASSET_HUB_MDNS` | `MAC_EDGE_IMG_MDNS` | `1`（广告 `_ha-img-server._tcp`） |
