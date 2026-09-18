@@ -91,6 +91,36 @@ bash scripts/backup.sh
 - 契约：`port=8080`（电视/小度的 URL 就是它）、`healthUrl=http://127.0.0.1:8080/health`、
   `startCmd/stopCmd/restartCmd = bash scripts/{start,stop,restart}.sh`
 
+#### ⚠️ 平台「服务登记」里的端口必须是 8080（踩过一次）
+
+2026-09-18 首次走平台发版时，服务登记页**自动给了一个空闲口 4236**，于是流水线跑成：
+
+```
+[deploy] pipeline-edf703c6 restart via contract (SERVICE_PORT=4236): bash scripts/restart.sh
+restart finished but health check failed: http://127.0.0.1:4236/health
+```
+
+服务其实起得好好的（`scripts/start.sh` 刻意忽略继承来的 `PORT/SERVICE_PORT`，永远绑 8080），
+**失败的是平台在 4236 上做健康检查**。修正方式（改登记，不是改代码）：
+
+```bash
+curl -X PUT http://127.0.0.1:4220/api/services/home-asset-hub \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"家庭资产管理","runtimeDir":"/Users/gaolei/runtime/home-asset-hub",
+       "healthUrl":"http://127.0.0.1:8080/health","port":8080,
+       "startCmd":"bash scripts/start.sh","stopCmd":"bash scripts/stop.sh",
+       "restartCmd":"bash scripts/restart.sh","defaultBranch":"main",
+       "restartNotifyUrl":"","restartPollUrl":"","gracefulRestartMaxWaitMs":0}'
+```
+
+（平台 UI「服务契约 → 配置」里改这两项等价。）之后重跑流水线即绿：`ok version=<hash>`。
+
+**为什么不能迁就平台给的口**：这个端口不是内部约定，是**外部消费方钉死的地址** ——
+小米电视/小度按 `http://<mac-lan-ip>:8080/<key>` 拉字节、Edge 按 `PHOTO_UPLOAD_PORT=8080`
+上传、Brain 的 `assets.storage.key` 与 mDNS 广告（`_ha-img-server._tcp port=8080`）也都在 8080。
+把服务挪到别的口 = 电视/音箱/Edge 全断。所以本服务是「端口由外部契约决定」的少数派，
+平台健康检查跟着登记走 8080 即可。
+
 ```
 <runtime>/home-asset-hub/
 ├── bin/assethub  scripts/            ← 发版包

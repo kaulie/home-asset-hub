@@ -41,7 +41,10 @@ if [ -z "${PORT}" ]; then
 fi
 if [ -z "${PORT}" ]; then PORT="${SERVICE_PORT:-8080}"; fi
 if [ -n "${SERVICE_PORT:-}" ] && [ "${SERVICE_PORT}" != "${PORT}" ]; then
-  warn "忽略继承来的 SERVICE_PORT=${SERVICE_PORT}（那是别的服务的），本服务用 ${PORT}"
+  warn "忽略继承来的 SERVICE_PORT=${SERVICE_PORT}（本服务的地址契约固定 :${PORT}）。"
+  warn "若平台报 “restart finished but health check failed: http://127.0.0.1:${SERVICE_PORT}/health”，"
+  warn "那是平台『服务登记』里的端口填错了：改成 port=${PORT} / health_url=http://127.0.0.1:${PORT}/health"
+  warn "（电视/小度/Edge/Brain 的 URL 都钉在 ${PORT}，本服务不能跟着平台分配的口走）。"
 fi
 
 [ -x "${BIN}" ] || die "缺少可执行文件 ${BIN}（发版包内容不完整？）"
