@@ -11,6 +11,18 @@
 //	ASSET_HUB_DIR  / PHOTO_UPLOAD_DIR      资源目录，默认 <runtime>/backend/data/img
 //	ASSET_HUB_PUBLIC_BASE / PHOTO_PUBLIC_BASE  对外地址（上传响应里的 url），默认按 LAN IP 探测
 //	ASSET_HUB_MDNS / MAC_EDGE_IMG_MDNS     =0 关闭 `_ha-img-server._tcp` 广告
+//
+// 资源管理 v2（默认值都按「不打扰现网」选，见 README）：
+//
+//	ASSET_HUB_DEDUPE              =1 上传同 sha256 复用已存在 key（默认 1；=0 关闭）
+//	ASSET_HUB_BACKUP              =0 关闭定时快照（默认 1）
+//	ASSET_HUB_BACKUP_DIR          快照根目录，默认 <资源目录>/../backup
+//	ASSET_HUB_BACKUP_INTERVAL     快照间隔（24h / 30m / 秒数），默认 24h
+//	ASSET_HUB_BACKUP_KEEP         保留几份快照，默认 7
+//	ASSET_HUB_INDEX_BUILD_ON_START =0 关闭启动补建 sha256 索引（默认 1）
+//	ASSET_HUB_RETENTION_DAYS      >0 才开保留策略（真删过期资源），默认 0=关
+//	ASSET_HUB_RETENTION_INTERVAL  保留策略间隔，默认 24h
+//	ASSET_HUB_RETENTION_MAX       单次最多删多少个，默认 200
 package main
 
 import (
@@ -29,6 +41,7 @@ import (
 	"time"
 
 	"github.com/kaulie/home-asset-hub/internal/httpapi"
+	"github.com/kaulie/home-asset-hub/internal/jobs"
 	"github.com/kaulie/home-asset-hub/internal/mdns"
 	"github.com/kaulie/home-asset-hub/internal/store"
 )
@@ -59,9 +72,30 @@ func main() {
 		publicBase = fmt.Sprintf("http://%s:%d", detectLANIPv4(), cfg.port)
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// 后台作业：快照备份 / 启动补索引 / （可选）保留策略
+	runner := jobs.New(st, jobs.Config{
+		BackupEnabled:      cfg.backup,
+		BackupDir:          cfg.backupDir,
+		BackupInterval:     cfg.backupInterval,
+		BackupKeep:         cfg.backupKeep,
+		RetentionEnabled:   cfg.retentionDays > 0,
+		RetentionDays:      cfg.retentionDays,
+		RetentionInterval:  cfg.retentionInterval,
+		RetentionMaxPerRun: cfg.retentionMax,
+		IndexBuildOnStart:  cfg.indexBuildOnStart,
+	}, logger)
+	runner.Start(ctx)
+
 	srv := &http.Server{
-		Addr:              net.JoinHostPort(cfg.host, strconv.Itoa(cfg.port)),
-		Handler:           httpapi.New(st, publicBase, logger).Handler(),
+		Addr: net.JoinHostPort(cfg.host, strconv.Itoa(cfg.port)),
+		Handler: httpapi.NewWithOptions(st, httpapi.Options{
+			PublicBase: publicBase,
+			Dedupe:     cfg.dedupe,
+			Jobs:       runner,
+		}, logger).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -82,6 +116,13 @@ func main() {
 		"addr", srv.Addr,
 		"dir", st.Dir(),
 		"public_base", publicBase,
+		"dedupe", cfg.dedupe,
+		"backup", cfg.backup,
+		"backup_dir", cfg.backupDir,
+		"backup_interval", cfg.backupInterval.String(),
+		"backup_keep", cfg.backupKeep,
+		"retention_days", cfg.retentionDays,
+		"index", st.IndexPath(),
 		"health", fmt.Sprintf("http://127.0.0.1:%d/health", cfg.port),
 	)
 
@@ -92,8 +133,6 @@ func main() {
 		}
 	}()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	select {
 	case err := <-errCh:
 		logger.Error("serve failed", "err", err)
@@ -116,6 +155,17 @@ type config struct {
 	dir        string
 	publicBase string
 	mdns       bool
+
+	dedupe            bool
+	backup            bool
+	backupDir         string
+	backupInterval    time.Duration
+	backupKeep        int
+	indexBuildOnStart bool
+
+	retentionDays     int
+	retentionInterval time.Duration
+	retentionMax      int
 }
 
 func loadConfig() (config, error) {
@@ -140,21 +190,109 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+
+	// 备份目录默认落在资源目录的兄弟位（<dir>/../backup）：不配置也能用，
+	// 且与资源目录同盘 —— 目标是「误删/误覆盖能回滚」，异地容灾不在本版范围。
+	backupDir := strings.TrimSpace(envFirst("ASSET_HUB_BACKUP_DIR", "", ""))
+	if backupDir == "" {
+		backupDir = filepath.Join(filepath.Dir(abs), "backup")
+	} else if backupDir, err = filepath.Abs(backupDir); err != nil {
+		return config{}, err
+	}
+	if backupDir == abs {
+		return config{}, errors.New("backup dir 不能等于资源目录")
+	}
+
+	backupInterval, err := envDuration([]string{"ASSET_HUB_BACKUP_INTERVAL"}, 24*time.Hour)
+	if err != nil {
+		return config{}, err
+	}
+	retentionInterval, err := envDuration([]string{"ASSET_HUB_RETENTION_INTERVAL"}, 24*time.Hour)
+	if err != nil {
+		return config{}, err
+	}
+	backupKeep, err := envInt([]string{"ASSET_HUB_BACKUP_KEEP"}, 7)
+	if err != nil {
+		return config{}, err
+	}
+	retentionDays, err := envInt([]string{"ASSET_HUB_RETENTION_DAYS"}, 0)
+	if err != nil {
+		return config{}, err
+	}
+	retentionMax, err := envInt([]string{"ASSET_HUB_RETENTION_MAX"}, 200)
+	if err != nil {
+		return config{}, err
+	}
+
 	return config{
-		host:       strings.TrimSpace(host),
-		port:       port,
-		dir:        abs,
-		publicBase: strings.TrimRight(strings.TrimSpace(publicBase), "/"),
-		mdns:       mdnsRaw != "0" && !strings.EqualFold(mdnsRaw, "false"),
+		host:              strings.TrimSpace(host),
+		port:              port,
+		dir:               abs,
+		publicBase:        strings.TrimRight(strings.TrimSpace(publicBase), "/"),
+		mdns:              mdnsRaw != "0" && !strings.EqualFold(mdnsRaw, "false"),
+		dedupe:            envBool([]string{"ASSET_HUB_DEDUPE"}, true),
+		backup:            envBool([]string{"ASSET_HUB_BACKUP"}, true),
+		backupDir:         backupDir,
+		backupInterval:    backupInterval,
+		backupKeep:        backupKeep,
+		indexBuildOnStart: envBool([]string{"ASSET_HUB_INDEX_BUILD_ON_START"}, true),
+		retentionDays:     retentionDays,
+		retentionInterval: retentionInterval,
+		retentionMax:      retentionMax,
 	}, nil
 }
 
+func envBool(keys []string, def bool) bool {
+	for _, key := range keys {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v != "0" && !strings.EqualFold(v, "false") && !strings.EqualFold(v, "no")
+		}
+	}
+	return def
+}
+
+func envInt(keys []string, def int) (int, error) {
+	for _, key := range keys {
+		v := strings.TrimSpace(os.Getenv(key))
+		if v == "" {
+			continue
+		}
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return 0, fmt.Errorf("env %s=%q 不是非负整数", key, v)
+		}
+		return n, nil
+	}
+	return def, nil
+}
+
+// envDuration 接受 Go 时长（24h/30m）或纯秒数。
+func envDuration(keys []string, def time.Duration) (time.Duration, error) {
+	for _, key := range keys {
+		v := strings.TrimSpace(os.Getenv(key))
+		if v == "" {
+			continue
+		}
+		if n, err := strconv.Atoi(v); err == nil {
+			if n < 0 {
+				return 0, fmt.Errorf("env %s=%q 不能为负", key, v)
+			}
+			return time.Duration(n) * time.Second, nil
+		}
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 0 {
+			return 0, fmt.Errorf("env %s=%q 不是合法时长（示例 24h / 30m / 秒数）", key, v)
+		}
+		return d, nil
+	}
+	return def, nil
+}
+
 func envFirst(keys ...string) string {
-	for i, key := range keys {
+	for _, key := range keys {
 		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 			return v
 		}
-		_ = i
 	}
 	return keys[len(keys)-1]
 }
