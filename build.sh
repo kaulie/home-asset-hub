@@ -41,7 +41,8 @@ echo "[build] vet + test"
 go vet ./...
 go test ./... >/dev/null
 
-cp "${ROOT}/scripts/start.sh" "${ROOT}/scripts/stop.sh" "${ROOT}/scripts/restart.sh" "${OUT}/scripts/"
+cp "${ROOT}/scripts/start.sh" "${ROOT}/scripts/stop.sh" "${ROOT}/scripts/restart.sh" \
+   "${ROOT}/scripts/backup.sh" "${ROOT}/scripts/verify.sh" "${OUT}/scripts/"
 cp "${ROOT}/README.md" "${OUT}/README.md" 2>/dev/null || true
 [ -f "${ROOT}/.env.example" ] && cp "${ROOT}/.env.example" "${OUT}/.env.example"
 chmod +x "${OUT}/bin/"* "${OUT}/scripts/"*.sh
