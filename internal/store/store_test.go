@@ -82,6 +82,27 @@ func TestListOrdersNewestFirstAndFiltersMime(t *testing.T) {
 	}
 }
 
+func TestListSkipsHiddenFiles(t *testing.T) {
+	dir := t.TempDir()
+	st, _ := New(dir)
+	if _, err := st.Put("a.mp3", []byte("audio")); err != nil {
+		t.Fatal(err)
+	}
+	// macOS 常见噪声：.DS_Store / 资源分叉
+	for _, junk := range []string{".DS_Store", "._a.mp3"} {
+		if err := os.WriteFile(filepath.Join(dir, junk), []byte("junk"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	infos, err := st.List(ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(infos) != 1 {
+		t.Fatalf("hidden files leaked into list: %+v", infos)
+	}
+}
+
 func TestLatestImage(t *testing.T) {
 	dir := t.TempDir()
 	st, _ := New(dir)
