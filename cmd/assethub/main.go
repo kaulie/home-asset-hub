@@ -12,6 +12,13 @@
 //	ASSET_HUB_PUBLIC_BASE / PHOTO_PUBLIC_BASE  对外地址（上传响应里的 url），默认按 LAN IP 探测
 //	ASSET_HUB_MDNS / MAC_EDGE_IMG_MDNS     =0 关闭 `_ha-img-server._tcp` 广告
 //
+// 端口说明（重要）：本服务的**地址契约固定 8080**（电视/小度/Edge/Brain 的 URL 都钉在它上面），
+// 所以 start.sh 刻意忽略平台注入的 SERVICE_PORT。为了让「平台登记填了别的口」也能通过健康检查，
+// 可以把那个口开成附加监听（只绑 loopback）：
+//
+//	ASSET_HUB_EXTRA_PORTS   逗号分隔的附加端口（如 4236,9000）；off/-/none=不加；空=不加
+//	ASSET_HUB_EXTRA_HOST    附加监听的绑定地址，默认 127.0.0.1（不对外）
+//
 // 资源管理 v2（默认值都按「不打扰现网」选，见 README）：
 //
 //	ASSET_HUB_DEDUPE              =1 上传同 sha256 复用已存在 key（默认 1；=0 关闭）
@@ -35,6 +42,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -89,31 +97,61 @@ func main() {
 	}, logger)
 	runner.Start(ctx)
 
+	// 监听地址：第 0 个是契约口（电视/小度/Edge/Brain 用的那个），后面是附加的健康检查口。
+	listeners := []string{net.JoinHostPort(cfg.host, strconv.Itoa(cfg.port))}
+	for _, p := range cfg.extraPorts {
+		listeners = append(listeners, net.JoinHostPort(cfg.extraHost, strconv.Itoa(p)))
+	}
+
+	handler := httpapi.NewWithOptions(st, httpapi.Options{
+		PublicBase: publicBase,
+		Dedupe:     cfg.dedupe,
+		Jobs:       runner,
+		Listeners:  listeners,
+	}, logger).Handler()
+
 	srv := &http.Server{
-		Addr: net.JoinHostPort(cfg.host, strconv.Itoa(cfg.port)),
-		Handler: httpapi.NewWithOptions(st, httpapi.Options{
-			PublicBase: publicBase,
-			Dedupe:     cfg.dedupe,
-			Jobs:       runner,
-		}, logger).Handler(),
+		Addr:              listeners[0],
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+	var extraServers []*http.Server
 
 	pub, err := mdns.Publish(mdns.Options{
 		Enabled:     cfg.mdns,
 		ServiceType: mdns.DefaultServiceType,
 		Instance:    mdns.DefaultInstance,
 		Hostname:    mdns.DefaultHostname,
-		Port:        cfg.port,
+		Port:        cfg.port, // mDNS 只广告契约口：iOS 靠它发现「电视那条链路」的地址
 	}, logger)
 	if err != nil {
 		logger.Warn("mdns publish failed", "err", err)
 	}
 	defer pub.Close()
 
+	// 附加监听：同一个 handler，只绑 loopback —— 平台登记填了别的口也能健康检查通过，
+	// 而外部消费方依赖的契约口一动不动（附加口不对外，也不进 mDNS）。
+	for _, p := range cfg.extraPorts {
+		extra := &http.Server{
+			Addr:              net.JoinHostPort(cfg.extraHost, strconv.Itoa(p)),
+			Handler:           handler,
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		extraServers = append(extraServers, extra)
+		go func(s *http.Server) {
+			if err := s.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				// 附加口只是「健康检查有位子」，绑不上不至于让主服务起不来
+				logger.Warn("extra listener stopped", "addr", s.Addr, "err", err)
+			}
+		}(extra)
+		logger.Info("extra listener started", "addr", extra.Addr,
+			"why", "健康检查口（只绑 loopback，不对外；契约口仍是"+listeners[0]+"）")
+	}
+
 	logger.Info("home-asset-hub starting",
 		"version", version,
 		"addr", srv.Addr,
+		"listeners", listeners,
 		"dir", st.Dir(),
 		"public_base", publicBase,
 		"dedupe", cfg.dedupe,
@@ -146,6 +184,9 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Warn("graceful shutdown failed", "err", err)
 	}
+	for _, extra := range extraServers {
+		_ = extra.Shutdown(shutdownCtx)
+	}
 	logger.Info("home-asset-hub stopped")
 }
 
@@ -162,6 +203,13 @@ type config struct {
 	backupInterval    time.Duration
 	backupKeep        int
 	indexBuildOnStart bool
+
+	// extraPorts 附加监听：契约口（8080）之外的「健康检查口」。
+	// 平台登记的服务端口会被注入成 SERVICE_PORT，start.sh 把它转成 ASSET_HUB_EXTRA_PORTS
+	// （只绑 extraHost=127.0.0.1）—— 这样平台健康检查填哪个口都有位子应答，
+	// 而电视/小度/Edge 依赖的 8080 契约一动不动。
+	extraPorts []int
+	extraHost  string
 
 	retentionDays     int
 	retentionInterval time.Duration
@@ -203,6 +251,11 @@ func loadConfig() (config, error) {
 		return config{}, errors.New("backup dir 不能等于资源目录")
 	}
 
+	extraPorts, err := parseExtraPorts(envFirst("ASSET_HUB_EXTRA_PORTS", "", ""), port)
+	if err != nil {
+		return config{}, err
+	}
+
 	backupInterval, err := envDuration([]string{"ASSET_HUB_BACKUP_INTERVAL"}, 24*time.Hour)
 	if err != nil {
 		return config{}, err
@@ -236,6 +289,8 @@ func loadConfig() (config, error) {
 		backupInterval:    backupInterval,
 		backupKeep:        backupKeep,
 		indexBuildOnStart: envBool([]string{"ASSET_HUB_INDEX_BUILD_ON_START"}, true),
+		extraPorts:        extraPorts,
+		extraHost:         envFirst("ASSET_HUB_EXTRA_HOST", "", "127.0.0.1"),
 		retentionDays:     retentionDays,
 		retentionInterval: retentionInterval,
 		retentionMax:      retentionMax,
@@ -249,6 +304,40 @@ func envBool(keys []string, def bool) bool {
 		}
 	}
 	return def
+}
+
+// parseExtraPorts 解析附加监听口（健康检查口）。
+//
+//	空          → 无附加口
+//	off/-/none  → 显式关掉（连 SERVICE_PORT 也不加）
+//	4236,9000   → 逗号分隔的端口列表
+//
+// 主口（8080）会被自动剔除：同一个口不重复监听。
+func parseExtraPorts(raw string, primary int) ([]int, error) {
+	spec := strings.TrimSpace(raw)
+	switch strings.ToLower(spec) {
+	case "", "-", "off", "none":
+		return nil, nil
+	}
+	seen := map[int]bool{primary: true}
+	var out []int
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		n, err := strconv.Atoi(part)
+		if err != nil || n <= 0 || n > 65535 {
+			return nil, fmt.Errorf("env ASSET_HUB_EXTRA_PORTS=%q 里有非法端口 %q（要 1..65535，逗号分隔）", raw, part)
+		}
+		if seen[n] {
+			continue
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	sort.Ints(out)
+	return out, nil
 }
 
 func envInt(keys []string, def int) (int, error) {
