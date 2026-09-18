@@ -91,35 +91,51 @@ bash scripts/backup.sh
 - 契约：`port=8080`（电视/小度的 URL 就是它）、`healthUrl=http://127.0.0.1:8080/health`、
   `startCmd/stopCmd/restartCmd = bash scripts/{start,stop,restart}.sh`
 
-#### ⚠️ 平台「服务登记」里的端口必须是 8080（踩过一次）
+#### 端口：契约口 8080 + 可配的「附加健康检查口」
 
-2026-09-18 首次走平台发版时，服务登记页**自动给了一个空闲口 4236**，于是流水线跑成：
+**8080 不是我们的内部约定，是四个外部消费方的默认值** —— 所以它由外部契约决定，不能跟着平台分配走：
+
+| 消费方 | 端口从哪来 | 换成别的口要改哪 |
+|---|---|---|
+| Brain 取字节 / 上传 | `BRAIN_IMG_UPLOAD_URL` / `PHOTO_UPLOAD_URL`，默认 `http://127.0.0.1:8080` | Brain env |
+| Brain 给的 LAN 地址（电视/小度拉流） | `BRAIN_IMG_PUBLIC_BASE` / `PHOTO_PUBLIC_BASE`，否则探测 `http://<lan-ip>:8080` | Brain env |
+| Mac Edge 上传 / 投屏 URL | `MAC_EDGE_LAN_PHOTO_PUBLIC_BASE` 或探测 `http://<lan-ip>:8080`；上传口默认 `127.0.0.1:8080` | Edge env |
+| iOS | mDNS `_ha-img-server._tcp` 的 **SRV 端口**（`Endpoint.port`） | 不用改（跟着我们广告的口） |
+| 云侧静态站 | `http://115.190.153.53:8080`（另一台机器，与本机口无关） | 与本服务无关 |
+
+技术上换口可行，但要**同步改 4 处配置 + 平台登记**，且任何一处漏改不是报错而是「静默拿不到字节」
+（电视投屏黑屏 / 上传丢到无人监听的口）。而 Brain 库里 74 行历史 asset 的 `public_base` 还写着
+旧 IP（`192.168.3.73:8080`）也说明：**存下来的 URL 不是权威**（`sdk/asset_bytes.py` 优先现算 loopback base）。
+收益为零、风险是全链路断一次 —— 所以契约口保持 8080。
+
+**但端口是配置化的**，而且「平台登记填了别的口」不再致命：
+
+```
+ASSET_HUB_PORT=8080            # 契约口（电视/小度/Edge/Brain 用的）
+ASSET_HUB_EXTRA_PORTS=4236,9000 # 附加监听口（逗号分隔；off/-/none=不附加；默认不附加）
+ASSET_HUB_EXTRA_HOST=127.0.0.1 # 附加口绑定地址，默认只绑 loopback（不对外、不进 mDNS）
+```
+
+- `scripts/start.sh` 检测到平台注入的 `SERVICE_PORT` ≠ 契约口时，**自动**把它放进 `ASSET_HUB_EXTRA_PORTS`
+  （日志会写「附加监听 127.0.0.1:4236 …」）→ **平台健康检查填哪个口都能 200**，而外部契约一点没动。
+- `/health` 新增 `listeners` 字段，一眼看到实际监听了哪些地址。
+- 想彻底关掉：`ASSET_HUB_EXTRA_PORTS=off`。
+
+#### 踩过的坑：健康检查查错口（2026-09-18）
+
+首次走平台发版时服务登记页**自动填了空闲口 4236**：
 
 ```
 [deploy] pipeline-edf703c6 restart via contract (SERVICE_PORT=4236): bash scripts/restart.sh
 restart finished but health check failed: http://127.0.0.1:4236/health
 ```
 
-服务其实起得好好的（`scripts/start.sh` 刻意忽略继承来的 `PORT/SERVICE_PORT`，永远绑 8080），
-**失败的是平台在 4236 上做健康检查**。修正方式（改登记，不是改代码）：
+服务其实起得好好的（绑 8080），失败的是平台在 4236 上做健康检查。当时的修法是**改登记**
+（`PUT /api/services/home-asset-hub`，`port=8080` / `healthUrl=http://127.0.0.1:8080/health`，
+平台 UI「服务契约 → 配置」等价），重跑流水线即绿 `ok version=<hash>`。
 
-```bash
-curl -X PUT http://127.0.0.1:4220/api/services/home-asset-hub \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"家庭资产管理","runtimeDir":"/Users/gaolei/runtime/home-asset-hub",
-       "healthUrl":"http://127.0.0.1:8080/health","port":8080,
-       "startCmd":"bash scripts/start.sh","stopCmd":"bash scripts/stop.sh",
-       "restartCmd":"bash scripts/restart.sh","defaultBranch":"main",
-       "restartNotifyUrl":"","restartPollUrl":"","gracefulRestartMaxWaitMs":0}'
-```
+现在已经双保险：登记按契约填 8080 **最好**（健康检查指向真身），填错了也有上面的附加监听兜住。
 
-（平台 UI「服务契约 → 配置」里改这两项等价。）之后重跑流水线即绿：`ok version=<hash>`。
-
-**为什么不能迁就平台给的口**：这个端口不是内部约定，是**外部消费方钉死的地址** ——
-小米电视/小度按 `http://<mac-lan-ip>:8080/<key>` 拉字节、Edge 按 `PHOTO_UPLOAD_PORT=8080`
-上传、Brain 的 `assets.storage.key` 与 mDNS 广告（`_ha-img-server._tcp port=8080`）也都在 8080。
-把服务挪到别的口 = 电视/音箱/Edge 全断。所以本服务是「端口由外部契约决定」的少数派，
-平台健康检查跟着登记走 8080 即可。
 
 ```
 <runtime>/home-asset-hub/
@@ -138,7 +154,9 @@ curl -X PUT http://127.0.0.1:4220/api/services/home-asset-hub \
 | 新名 | 兼容旧名 | 默认 |
 |---|---|---|
 | `ASSET_HUB_HOST` | `PHOTO_UPLOAD_HOST` | `0.0.0.0` |
-| `ASSET_HUB_PORT` | `PHOTO_UPLOAD_PORT` | `8080` |
+| `ASSET_HUB_PORT` | `PHOTO_UPLOAD_PORT` | `8080`（外部契约口） |
+| `ASSET_HUB_EXTRA_PORTS` | — | 空（附加健康检查口，逗号分隔；只绑 loopback；`off` 关） |
+| `ASSET_HUB_EXTRA_HOST` | — | `127.0.0.1` |
 | `ASSET_HUB_DIR` | `PHOTO_UPLOAD_DIR` | `<runtime>/backend/data/img` |
 | `ASSET_HUB_PUBLIC_BASE` | `PHOTO_PUBLIC_BASE` | 按 LAN IP 自动探测 |
 | `ASSET_HUB_MDNS` | `MAC_EDGE_IMG_MDNS` | `1`（广告 `_ha-img-server._tcp`） |

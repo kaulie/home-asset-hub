@@ -59,9 +59,10 @@ type Jobs interface {
 
 // Options 组装参数。
 type Options struct {
-	PublicBase string // 上传响应里的 url 前缀；空则按请求 Host 兜底
-	Dedupe     bool   // 上传时同 sha256 复用已存在的 key
-	Jobs       Jobs   // 维护作业；nil=维护接口返回 503
+	PublicBase string   // 上传响应里的 url 前缀；空则按请求 Host 兜底
+	Dedupe     bool     // 上传时同 sha256 复用已存在的 key
+	Jobs       Jobs     // 维护作业；nil=维护接口返回 503
+	Listeners  []string // 实际监听地址（契约口 + 附加健康检查口），给 /health 看
 }
 
 // Server 组装路由。
@@ -70,6 +71,7 @@ type Server struct {
 	publicBase string
 	dedupe     bool
 	jobs       Jobs
+	listeners  []string
 	logger     *slog.Logger
 	startedAt  time.Time
 
@@ -90,6 +92,7 @@ func NewWithOptions(st *store.Store, opts Options, logger *slog.Logger) *Server 
 		publicBase: strings.TrimRight(strings.TrimSpace(opts.PublicBase), "/"),
 		dedupe:     opts.Dedupe,
 		jobs:       opts.Jobs,
+		listeners:  opts.Listeners,
 		logger:     logger,
 		startedAt:  time.Now(),
 	}
@@ -190,6 +193,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"verify":       ms["verify"],
 		"snapshots":    ms["snapshots"],
 		"retention_on": s.retentionEnabled(),
+	}
+	if len(s.listeners) > 0 {
+		payload["listeners"] = s.listeners // 契约口 + 附加健康检查口（排查「健康检查查错口」时一眼可见）
 	}
 	writeJSON(w, http.StatusOK, payload)
 }
