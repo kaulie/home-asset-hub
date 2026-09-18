@@ -91,50 +91,48 @@ bash scripts/backup.sh
 - 契约：`port=8080`（电视/小度的 URL 就是它）、`healthUrl=http://127.0.0.1:8080/health`、
   `startCmd/stopCmd/restartCmd = bash scripts/{start,stop,restart}.sh`
 
-#### 端口：契约口 8080 + 可配的「附加健康检查口」
+#### 端口：由本服务决定，消费方靠「发现」跟着走
 
-**8080 不是我们的内部约定，是四个外部消费方的默认值** —— 所以它由外部契约决定，不能跟着平台分配走：
+**8080 不是我们的内部约定，而是外部消费方的起点默认值** —— 所以正解不是让四方继续硬编码它，
+而是**端口由本服务决定**（`ASSET_HUB_PORT`），消费方**按名字发现**：
 
-| 消费方 | 端口从哪来 | 换成别的口要改哪 |
-|---|---|---|
-| Brain 取字节 / 上传 | `BRAIN_IMG_UPLOAD_URL` / `PHOTO_UPLOAD_URL`，默认 `http://127.0.0.1:8080` | Brain env |
-| Brain 给的 LAN 地址（电视/小度拉流） | `BRAIN_IMG_PUBLIC_BASE` / `PHOTO_PUBLIC_BASE`，否则探测 `http://<lan-ip>:8080` | Brain env |
-| Mac Edge 上传 / 投屏 URL | `MAC_EDGE_LAN_PHOTO_PUBLIC_BASE` 或探测 `http://<lan-ip>:8080`；上传口默认 `127.0.0.1:8080` | Edge env |
-| iOS | mDNS `_ha-img-server._tcp` 的 **SRV 端口**（`Endpoint.port`） | 不用改（跟着我们广告的口） |
-| 云侧静态站 | `http://115.190.153.53:8080`（另一台机器，与本机口无关） | 与本服务无关 |
+| 层 | 机制 | 谁用 | 特点 |
+|---|---|---|---|
+| 1 | **端点文件**：本服务启动时写 `<runtime>/backend/endpoint.json` 与 `<runtime>/../.discovery/home-asset-hub.json`（含 port / public_base / health / endpoints） | Brain、mac_edge（同机） | 确定性、零延迟，读到还要过 `/health` 自校验 |
+| 2 | **mDNS** `_ha-img-server._tcp`（TXT 带 `port=` / `base=` / `health=` / `version=`） | iOS、电视等跨设备；Brain/Edge 兜底 | 跨设备唯一可行；实测本机 `dns-sd` 不稳，故不做主路径 |
+| 3 | 默认 `8080` | 兜底 | = 改动前的行为，永远退得回去 |
 
-技术上换口可行，但要**同步改 4 处配置 + 平台登记**，且任何一处漏改不是报错而是「静默拿不到字节」
-（电视投屏黑屏 / 上传丢到无人监听的口）。而 Brain 库里 74 行历史 asset 的 `public_base` 还写着
-旧 IP（`192.168.3.73:8080`）也说明：**存下来的 URL 不是权威**（`sdk/asset_bytes.py` 优先现算 loopback base）。
-收益为零、风险是全链路断一次 —— 所以契约口保持 8080。
+- 消费方解析顺序统一为：**显式 env > 端点文件 > mDNS > 已验证缓存 > 8080**，每层都过 `/health` 自校验
+  （发现到的端口不通就丢掉，不会把人带到没应答的口上）；发现失败有**负缓存**（15s），
+  请求路径不会被 Bonjour 挡住（首次阻塞一次、之后后台刷新）。
+- 换端口只改**这一处**：`ASSET_HUB_PORT=18099` → 端点文件/mDNS 自动跟着变，Brain/Edge 下次解析即跟上。
+- 已知边界：iOS 端目前仍写死 `http://img-server.local:8080` 作为兜底常量（发现路径可用时会用 SRV 端口）；
+  要让 iPhone 也完全跟随，需要一次 App 端调整。
 
-**但端口是配置化的**，而且「平台登记填了别的口」不再致命：
-
-```
-ASSET_HUB_PORT=8080            # 契约口（电视/小度/Edge/Brain 用的）
-ASSET_HUB_EXTRA_PORTS=4236,9000 # 附加监听口（逗号分隔；off/-/none=不附加；默认不附加）
-ASSET_HUB_EXTRA_HOST=127.0.0.1 # 附加口绑定地址，默认只绑 loopback（不对外、不进 mDNS）
-```
-
-- `scripts/start.sh` 检测到平台注入的 `SERVICE_PORT` ≠ 契约口时，**自动**把它放进 `ASSET_HUB_EXTRA_PORTS`
-  （日志会写「附加监听 127.0.0.1:4236 …」）→ **平台健康检查填哪个口都能 200**，而外部契约一点没动。
-- `/health` 新增 `listeners` 字段，一眼看到实际监听了哪些地址。
-- 想彻底关掉：`ASSET_HUB_EXTRA_PORTS=off`。
-
-#### 踩过的坑：健康检查查错口（2026-09-18）
-
-首次走平台发版时服务登记页**自动填了空闲口 4236**：
+**平台登记**：建议按契约填 `port=8080`（健康检查指向真身）；填了别的口也不会红 ——
+`start.sh` 会把平台注入的 `SERVICE_PORT` 开成「附加健康检查口」（只绑 loopback），
+见下面这节。
 
 ```
-[deploy] pipeline-edf703c6 restart via contract (SERVICE_PORT=4236): bash scripts/restart.sh
-restart finished but health check failed: http://127.0.0.1:4236/health
+ASSET_HUB_PORT=8080              # 契约口（本服务决定；消费者发现它）
+ASSET_HUB_EXTRA_PORTS=4236,9000  # 附加监听口（平台填错口的兜底）；off/-/none=不附加
+ASSET_HUB_EXTRA_HOST=127.0.0.1   # 附加口只绑 loopback（不对外、不进 mDNS）
+ASSET_HUB_SERVICE_ID=home-asset-hub
+ASSET_HUB_ENDPOINT_FILE=<runtime>/backend/endpoint.json     # start.sh 默认给
+ASSET_HUB_DISCOVERY_DIR=<runtime>/../.discovery             # start.sh 默认给
 ```
 
-服务其实起得好好的（绑 8080），失败的是平台在 4236 上做健康检查。当时的修法是**改登记**
-（`PUT /api/services/home-asset-hub`，`port=8080` / `healthUrl=http://127.0.0.1:8080/health`，
-平台 UI「服务契约 → 配置」等价），重跑流水线即绿 `ok version=<hash>`。
+#### 踩过的坑
 
-现在已经双保险：登记按契约填 8080 **最好**（健康检查指向真身），填错了也有上面的附加监听兜住。
+1. **健康检查查错口**（2026-09-18）：平台服务登记页自动填了空闲口 4236，服务按契约绑 8080 →
+   流水线报 `restart finished but health check failed: http://127.0.0.1:4236/health`。
+   修法是改登记（`PUT /api/services/home-asset-hub` → `port=8080`），现在另有附加监听兜底。
+2. **`dns-sd` 的坑（发现路径本来是坏的）**：`dns-sd -L` 命中后**不退出**，`subprocess.run` 会一直等到
+   超时并把已读到的输出丢掉 → 明明有服务却永远发现不到；`dns-sd -B` 在本机也列不出自家注册，
+   而且 `-B` 的实例名在**最后一列**（早先按第 4 列取到的是域名）。现在改成 Popen 边读边判 + 已知名字直查。
+3. **导入期不做发现**：`DEFAULT_LAN_PUBLIC_BASE = default_lan_public_base()` 曾在 import 时触发发现，
+   把负缓存打脏、连带影响别处；现在导入期只算默认端口的形态。
+4. 行尾 `Flags: 1` 这类**带冒号的尾巴**会把「按最后一个冒号取端口」读成 `1`；改为取第一个 token 再切 host:port。
 
 
 ```
@@ -157,6 +155,9 @@ restart finished but health check failed: http://127.0.0.1:4236/health
 | `ASSET_HUB_PORT` | `PHOTO_UPLOAD_PORT` | `8080`（外部契约口） |
 | `ASSET_HUB_EXTRA_PORTS` | — | 空（附加健康检查口，逗号分隔；只绑 loopback；`off` 关） |
 | `ASSET_HUB_EXTRA_HOST` | — | `127.0.0.1` |
+| `ASSET_HUB_SERVICE_ID` | — | `home-asset-hub`（端点文件名/字段） |
+| `ASSET_HUB_ENDPOINT_FILE` | — | `<runtime>/backend/endpoint.json`（start.sh 给） |
+| `ASSET_HUB_DISCOVERY_DIR` | — | `<runtime>/../.discovery`（start.sh 给；写 `<id>.json`） |
 | `ASSET_HUB_DIR` | `PHOTO_UPLOAD_DIR` | `<runtime>/backend/data/img` |
 | `ASSET_HUB_PUBLIC_BASE` | `PHOTO_PUBLIC_BASE` | 按 LAN IP 自动探测 |
 | `ASSET_HUB_MDNS` | `MAC_EDGE_IMG_MDNS` | `1`（广告 `_ha-img-server._tcp`） |

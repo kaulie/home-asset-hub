@@ -71,6 +71,12 @@ set +a
 ASSET_HUB_DIR="${ASSET_HUB_DIR:-${BACKEND_DIR}/data/img}"
 export ASSET_HUB_DIR ASSET_HUB_PORT="${PORT}" ASSET_HUB_HOST="${ASSET_HUB_HOST:-0.0.0.0}"
 export ASSET_HUB_EXTRA_PORTS="${ASSET_HUB_EXTRA_PORTS:-}"
+
+# 端点落盘（发现的第一层）：本服务 runtime 里一份，共享发现目录里再一份 ——
+# Brain/Edge 读它就知道端口，不必各自硬编码 8080（mDNS 只是跨设备那层的兜底）。
+export ASSET_HUB_SERVICE_ID="${ASSET_HUB_SERVICE_ID:-home-asset-hub}"
+export ASSET_HUB_ENDPOINT_FILE="${ASSET_HUB_ENDPOINT_FILE:-${BACKEND_DIR}/endpoint.json}"
+export ASSET_HUB_DISCOVERY_DIR="${ASSET_HUB_DISCOVERY_DIR:-$(cd "${RUNTIME_DIR}/.." && pwd)/.discovery}"
 mkdir -p "${ASSET_HUB_DIR}"
 
 if [ -f "${PID_FILE}" ]; then

@@ -19,6 +19,16 @@
 //	ASSET_HUB_EXTRA_PORTS   逗号分隔的附加端口（如 4236,9000）；off/-/none=不加；空=不加
 //	ASSET_HUB_EXTRA_HOST    附加监听的绑定地址，默认 127.0.0.1（不对外）
 //
+// 发现（「端口由服务自己决定」的另一半 —— 让消费方不用猜）：
+//
+//		ASSET_HUB_SERVICE_ID      服务名（端点文件名/字段），默认 home-asset-hub
+//		ASSET_HUB_ENDPOINT_FILE   端点文件路径（如 <runtime>/backend/endpoint.json）
+//		ASSET_HUB_DISCOVERY_DIR   共享发现目录（如 <runtime>/../.discovery，写 <id>.json）
+//
+//	  - 端点文件 = 第一层发现：确定性、零延迟，Brain/Edge 读它就知道端口与各能力路径；
+//	  - mDNS `_ha-img-server._tcp` = 第二层（跨设备，iOS/电视那条链路）；
+//	  - 两者都没读到就退回 8080（= 现网行为）。
+//
 // 资源管理 v2（默认值都按「不打扰现网」选，见 README）：
 //
 //	ASSET_HUB_DEDUPE              =1 上传同 sha256 复用已存在 key（默认 1；=0 关闭）
@@ -48,6 +58,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kaulie/home-asset-hub/internal/endpoint"
 	"github.com/kaulie/home-asset-hub/internal/httpapi"
 	"github.com/kaulie/home-asset-hub/internal/jobs"
 	"github.com/kaulie/home-asset-hub/internal/mdns"
@@ -102,6 +113,7 @@ func main() {
 	for _, p := range cfg.extraPorts {
 		listeners = append(listeners, net.JoinHostPort(cfg.extraHost, strconv.Itoa(p)))
 	}
+	startedAt := time.Now()
 
 	handler := httpapi.NewWithOptions(st, httpapi.Options{
 		PublicBase: publicBase,
@@ -122,7 +134,9 @@ func main() {
 		ServiceType: mdns.DefaultServiceType,
 		Instance:    mdns.DefaultInstance,
 		Hostname:    mdns.DefaultHostname,
-		Port:        cfg.port, // mDNS 只广告契约口：iOS 靠它发现「电视那条链路」的地址
+		Port:        cfg.port, // mDNS 就是「端口权威」：广告的是本服务真实监听的口
+		Version:     version,
+		PublicBase:  publicBase,
 	}, logger)
 	if err != nil {
 		logger.Warn("mdns publish failed", "err", err)
@@ -147,6 +161,40 @@ func main() {
 		logger.Info("extra listener started", "addr", extra.Addr,
 			"why", "健康检查口（只绑 loopback，不对外；契约口仍是"+listeners[0]+"）")
 	}
+
+	// 端点落盘（发现的第一层：确定性、零延迟）——Brain/Edge 读它就不必猜端口。
+	publishEndpoint := func() {
+		payload := endpoint.Payload{
+			Version:    version,
+			Host:       cfg.host,
+			Port:       cfg.port,
+			PublicBase: publicBase,
+			HealthPath: mdns.HealthPath,
+			Endpoints: map[string]string{
+				"assets":      mdns.APIPath,
+				"upload":      httpapi.UploadPath,
+				"latest":      "/latest",
+				"maintenance": "/api/v1/maintenance/status",
+				"verify":      "/api/v1/maintenance/verify",
+				"backup":      "/api/v1/maintenance/backup",
+				"prune":       "/api/v1/maintenance/prune",
+			},
+			Listeners: listeners,
+			PID:       os.Getpid(),
+			StartedAt: startedAt.Format(time.RFC3339),
+		}
+		if cfg.endpointFile != "" {
+			if _, err := endpoint.WritePath(cfg.endpointFile, cfg.serviceID, payload, logger); err != nil {
+				logger.Warn("endpoint publish failed", "path", cfg.endpointFile, "err", err)
+			}
+		}
+		if cfg.discoveryDir != "" {
+			if _, err := endpoint.Write(cfg.discoveryDir, cfg.serviceID, payload, logger); err != nil {
+				logger.Warn("endpoint publish failed", "dir", cfg.discoveryDir, "err", err)
+			}
+		}
+	}
+	publishEndpoint()
 
 	logger.Info("home-asset-hub starting",
 		"version", version,
@@ -210,6 +258,11 @@ type config struct {
 	// 而电视/小度/Edge 依赖的 8080 契约一动不动。
 	extraPorts []int
 	extraHost  string
+
+	// 端点落盘 / 发现（「命名发现」的第一层；见 internal/endpoint）
+	serviceID    string
+	endpointFile string
+	discoveryDir string
 
 	retentionDays     int
 	retentionInterval time.Duration
@@ -291,6 +344,9 @@ func loadConfig() (config, error) {
 		indexBuildOnStart: envBool([]string{"ASSET_HUB_INDEX_BUILD_ON_START"}, true),
 		extraPorts:        extraPorts,
 		extraHost:         envFirst("ASSET_HUB_EXTRA_HOST", "", "127.0.0.1"),
+		serviceID:         envFirst("ASSET_HUB_SERVICE_ID", "", "home-asset-hub"),
+		endpointFile:      strings.TrimSpace(envFirst("ASSET_HUB_ENDPOINT_FILE", "", "")),
+		discoveryDir:      strings.TrimSpace(envFirst("ASSET_HUB_DISCOVERY_DIR", "", "")),
 		retentionDays:     retentionDays,
 		retentionInterval: retentionInterval,
 		retentionMax:      retentionMax,
