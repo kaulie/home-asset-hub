@@ -32,7 +32,17 @@ BACKEND_DIR="${RUNTIME_DIR}/backend"
 ENV_FILE="${BACKEND_DIR}/.env"
 PID_FILE="${BACKEND_DIR}/runtime.pid"
 LOG_FILE="${BACKEND_DIR}/server.log"
-PORT="${SERVICE_PORT:-${ASSET_HUB_PORT:-8080}}"
+# 端口解析：ASSET_HUB_PORT（shell）> backend/.env 的 ASSET_HUB_PORT > 平台注入的 SERVICE_PORT > 8080。
+# **刻意不读继承来的 PORT**：交互式 shell 里常残留别的服务的 PORT/SERVICE_PORT
+# （实测 web-cursor 4211），照它走会把本服务绑到别人的口上。
+PORT="${ASSET_HUB_PORT:-}"
+if [ -z "${PORT}" ]; then
+  PORT="$(awk -F= '/^[[:space:]]*ASSET_HUB_PORT[[:space:]]*=/{gsub(/[[:space:]"]/,"",$2); v=$2} END{print v}' "${ENV_FILE}" 2>/dev/null || true)"
+fi
+if [ -z "${PORT}" ]; then PORT="${SERVICE_PORT:-8080}"; fi
+if [ -n "${SERVICE_PORT:-}" ] && [ "${SERVICE_PORT}" != "${PORT}" ]; then
+  warn "忽略继承来的 SERVICE_PORT=${SERVICE_PORT}（那是别的服务的），本服务用 ${PORT}"
+fi
 
 [ -x "${BIN}" ] || die "缺少可执行文件 ${BIN}（发版包内容不完整？）"
 
@@ -66,8 +76,9 @@ fi
 if command -v lsof >/dev/null 2>&1; then
   holder="$(lsof -nP -iTCP:"${PORT}" -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
   if [ -n "${holder}" ]; then
-    die "端口 ${PORT} 已被 pid=${holder} 占用：$(ps -o command= -ww -p "${holder}" 2>/dev/null | head -c 160)
-      旧 img-server（python）也在这个口上：先停掉它再起本服务"
+    hint=""
+    if [ "${PORT}" = "8080" ]; then hint="（旧 Python img-server 也在这个口上：先停掉它）"; fi
+    die "端口 ${PORT} 已被 pid=${holder} 占用：$(ps -o command= -ww -p "${holder}" 2>/dev/null | head -c 160)${hint}"
   fi
 fi
 

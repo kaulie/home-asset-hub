@@ -152,7 +152,7 @@ func (s *Store) List(opts ListOptions) ([]Info, error) {
 	}
 	out := make([]Info, 0, len(entries))
 	for _, e := range entries {
-		if e.IsDir() {
+		if e.IsDir() || isHidden(e.Name()) {
 			continue
 		}
 		fi, err := e.Info()
@@ -186,7 +186,7 @@ func (s *Store) LatestImage() (string, bool) {
 	var newest string
 	var newestAt time.Time
 	for _, e := range entries {
-		if e.IsDir() || !isImageName(e.Name()) {
+		if e.IsDir() || isHidden(e.Name()) || !isImageName(e.Name()) {
 			continue
 		}
 		fi, err := e.Info()
@@ -219,6 +219,9 @@ func mimeTypeOf(name string) string {
 	}
 	return "application/octet-stream"
 }
+
+// isHidden：`.DS_Store`、资源分叉文件（`._x`）之类不该出现在清单/最新图里。
+func isHidden(name string) bool { return strings.HasPrefix(name, ".") }
 
 func isImageName(name string) bool {
 	switch strings.ToLower(filepath.Ext(name)) {
